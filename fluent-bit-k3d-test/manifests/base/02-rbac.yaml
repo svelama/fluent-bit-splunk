@@ -1,0 +1,87 @@
+---
+# ServiceAccount for Fluent Bit
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: logging
+---
+# ClusterRole for reading namespaces and pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-cluster-reader
+rules:
+- apiGroups: [""]
+  resources:
+  - namespaces
+  - pods
+  verbs: ["get", "list", "watch"]
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-cluster-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-cluster-reader
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: logging
+---
+# Role for reading secrets in team-alpha namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fluent-bit-secret-reader
+  namespace: team-alpha
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["splunk-config"]  # Only this specific secret
+  verbs: ["get"]
+---
+# RoleBinding for team-alpha
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fluent-bit-secret-reader
+  namespace: team-alpha
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fluent-bit-secret-reader
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: logging
+---
+# Role for reading secrets in team-beta namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fluent-bit-secret-reader
+  namespace: team-beta
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["splunk-config"]  # Only this specific secret
+  verbs: ["get"]
+---
+# RoleBinding for team-beta
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fluent-bit-secret-reader
+  namespace: team-beta
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fluent-bit-secret-reader
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: logging

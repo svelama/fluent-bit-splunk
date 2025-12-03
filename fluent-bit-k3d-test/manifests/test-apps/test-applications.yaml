@@ -1,0 +1,96 @@
+---
+# Test application in team-alpha namespace
+# Logs should be collected and sent to Splunk
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-app-alpha
+  namespace: team-alpha
+  labels:
+    app: test-app
+    team: alpha
+    environment: test
+spec:
+  containers:
+  - name: app
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Starting test-app-alpha..."
+      i=0
+      while true; do
+        i=$((i+1))
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-alpha application\",\"counter\":$i,\"team\":\"alpha\"}"
+        sleep 5
+      done
+    resources:
+      limits:
+        memory: 64Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+---
+# Test application in team-beta namespace
+# Logs should be collected and sent to Splunk
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-app-beta
+  namespace: team-beta
+  labels:
+    app: test-app
+    team: beta
+    environment: test
+spec:
+  containers:
+  - name: app
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Starting test-app-beta..."
+      i=0
+      while true; do
+        i=$((i+1))
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-beta application\",\"counter\":$i,\"team\":\"beta\"}"
+        sleep 5
+      done
+    resources:
+      limits:
+        memory: 64Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi
+---
+# Test application in team-gamma namespace
+# Logs should NOT be collected (namespace not labeled)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-app-gamma
+  namespace: team-gamma
+  labels:
+    app: test-app
+    team: gamma
+    environment: test
+spec:
+  containers:
+  - name: app
+    image: busybox:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Starting test-app-gamma..."
+      i=0
+      while true; do
+        i=$((i+1))
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"WARN\",\"message\":\"Log from team-gamma - SHOULD BE FILTERED OUT\",\"counter\":$i,\"team\":\"gamma\"}"
+        sleep 5
+      done
+    resources:
+      limits:
+        memory: 64Mi
+      requests:
+        cpu: 10m
+        memory: 32Mi

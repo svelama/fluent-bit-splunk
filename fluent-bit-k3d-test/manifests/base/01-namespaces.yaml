@@ -1,0 +1,47 @@
+---
+# Logging namespace for Fluent Bit
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    name: logging
+---
+# Mock Splunk namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: splunk-mock
+  labels:
+    name: splunk-mock
+---
+# Team Alpha namespace - WITH label (logs will be collected)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-alpha
+  labels:
+    name: team-alpha
+    team: alpha
+    fluent-bit-enabled: "true"  # This enables log collection
+---
+# Team Beta namespace - WITH label (logs will be collected)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-beta
+  labels:
+    name: team-beta
+    team: beta
+    fluent-bit-enabled: "true"  # This enables log collection
+---
+# Team Gamma namespace - NO label (logs will NOT be collected)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-gamma
+  labels:
+    name: team-gamma
+    team: gamma
+    # Note: fluent-bit-enabled label is intentionally missing
+    # This namespace's logs should be filtered out

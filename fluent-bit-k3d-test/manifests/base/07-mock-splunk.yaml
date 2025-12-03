@@ -1,0 +1,111 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-splunk-server
+  namespace: splunk-mock
+data:
+  server.py: |
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import json
+    import sys
+    from datetime import datetime
+    
+    class SplunkMockHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            
+            # Log received data
+            timestamp = datetime.now().isoformat()
+            auth_header = self.headers.get('Authorization', 'No token')
+            
+            print(f"\n{'='*80}")
+            print(f"[{timestamp}] Received log event")
+            print(f"Path: {self.path}")
+            print(f"Authorization: {auth_header}")
+            print(f"Content-Type: {self.headers.get('Content-Type')}")
+            
+            # Try to parse JSON
+            try:
+                body_str = body.decode('utf-8')
+                body_json = json.loads(body_str)
+                print(f"Body (parsed):")
+                print(json.dumps(body_json, indent=2)[:1000])
+            except:
+                print(f"Body (raw): {body.decode('utf-8', errors='ignore')[:500]}")
+            
+            print(f"{'='*80}\n")
+            sys.stdout.flush()
+            
+            # Return success response
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            response = json.dumps({"text": "Success", "code": 0})
+            self.wfile.write(response.encode())
+        
+        def log_message(self, format, *args):
+            # Suppress default logging
+            pass
+    
+    if __name__ == '__main__':
+        port = 8088
+        server = HTTPServer(('0.0.0.0', port), SplunkMockHandler)
+        print(f"Mock Splunk HEC server listening on port {port}")
+        print(f"Ready to receive log events...")
+        sys.stdout.flush()
+        server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-splunk
+  namespace: splunk-mock
+  labels:
+    app: mock-splunk
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-splunk
+  template:
+    metadata:
+      labels:
+        app: mock-splunk
+    spec:
+      containers:
+      - name: mock-splunk
+        image: python:3.9-slim
+        command: ["python", "/app/server.py"]
+        ports:
+        - containerPort: 8088
+          name: hec
+        volumeMounts:
+        - name: server-script
+          mountPath: /app
+        resources:
+          limits:
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: server-script
+        configMap:
+          name: mock-splunk-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-splunk
+  namespace: splunk-mock
+spec:
+  selector:
+    app: mock-splunk
+  ports:
+  - port: 8088
+    targetPort: 8088
+    protocol: TCP
+    name: hec
+  type: ClusterIP
