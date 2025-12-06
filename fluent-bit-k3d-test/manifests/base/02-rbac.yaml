@@ -41,7 +41,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  resourceNames: ["splunk-config"]  # Only this specific secret
+  resourceNames: ["splunk-token"]  # Only this specific secret
   verbs: ["get"]
 ---
 # RoleBinding for team-alpha
@@ -68,7 +68,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  resourceNames: ["splunk-config"]  # Only this specific secret
+  resourceNames: ["splunk-token"]  # Only this specific secret
   verbs: ["get"]
 ---
 # RoleBinding for team-beta

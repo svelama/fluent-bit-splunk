@@ -3,6 +3,8 @@
 # Removes all resources and k3d cluster
 
 CLUSTER_NAME="fluent-bit-test"
+# CLUSTER_NAME="test"
+
 
 echo "🗑️  Cleanup Script"
 echo "=================="

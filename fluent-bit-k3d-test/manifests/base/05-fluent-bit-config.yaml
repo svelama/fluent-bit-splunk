@@ -35,26 +35,47 @@ data:
         Labels              On
         Annotations         Off
 
-    # Filter 1: Check if namespace has required label
+    # Exclude Fluent Bit's own logs to prevent recursive processing
     [FILTER]
-        Name    lua
+        Name    grep
         Match   kube.*
-        script  /fluent-bit/scripts/filter_namespace.lua
-        call    filter_by_namespace_label
+        Exclude kubernetes.namespace_name logging
 
-    # Filter 2: Check if it's an application container
+    # Add metadata field to determine routing
     [FILTER]
         Name    lua
         Match   kube.*
-        script  /fluent-bit/scripts/filter_container.lua
-        call    filter_application_containers
+        script  /fluent-bit/scripts/retag_logs.lua
+        call    retag_by_label_and_container
 
-    # Filter 3: Enrich with Splunk config from secrets
+    # Re-tag: consumer-logs (pod has label "consumer-splunk-index" AND container name is "app")
+    [FILTER]
+        Name                rewrite_tag
+        Match               kube.*
+        Rule                $_log_type ^consumer$ consumer-logs true
+        Emitter_Name        re_emitted_consumer
+
+    # Re-tag: tdp-infra (all other logs)
+    [FILTER]
+        Name                rewrite_tag
+        Match               kube.*
+        Rule                $_log_type ^infrastructure$ tdp-infra true
+        Emitter_Name        re_emitted_infra
+
+    # Filter: Enrich consumer logs with Splunk token from secrets
+    # Note: splunk_index is already set by retag_logs.lua from pod label
     [FILTER]
         Name    lua
-        Match   kube.*
+        Match   consumer-logs
         script  /fluent-bit/scripts/enrich_splunk.lua
         call    enrich_with_splunk_config
+
+    # Filter: Enrich infrastructure logs with static Splunk index and token
+    [FILTER]
+        Name    modify
+        Match   tdp-infra
+        Add     splunk_index tdp-infrastructure-index
+        Add     splunk_token INFRA-TOKEN-STATIC
 
     # Output to stdout for debugging
     [OUTPUT]
@@ -62,15 +83,27 @@ data:
         Match  *
         Format json_lines
 
-    # Output to Mock Splunk (or real Splunk HEC)
+    # Output: Consumer logs to Splunk (with dynamic index from label)
     [OUTPUT]
         Name        http
-        Match       *
-        Host        mock-splunk.splunk-mock.svc.cluster.local
+        Match       consumer-logs
+        Host        mock-splunk-consumer.splunk-mock.svc.cluster.local
         Port        8088
         URI         /services/collector/event
         Format      json
         Header      Authorization Splunk ${splunk_token}
+        json_date_key timestamp
+        json_date_format iso8601
+
+    # Output: TDP Infrastructure logs to separate Splunk instance
+    [OUTPUT]
+        Name        http
+        Match       tdp-infra
+        Host        mock-splunk-infra.splunk-mock.svc.cluster.local
+        Port        8088
+        URI         /services/collector/event
+        Format      json
+        Header      Authorization Splunk INFRA-TOKEN-STATIC
         json_date_key timestamp
         json_date_format iso8601
 

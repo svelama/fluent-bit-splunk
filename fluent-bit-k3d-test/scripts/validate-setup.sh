@@ -62,25 +62,23 @@ check_resource "rolebinding" "team-beta" "fluent-bit-secret-reader"
 echo ""
 echo "3️⃣  Checking Secrets:"
 echo "━━━━━━━━━━━━━━━━━━━━"
-check_resource "secret" "team-alpha" "splunk-config"
-check_resource "secret" "team-beta" "splunk-config"
+check_resource "secret" "team-alpha" "splunk-token"
+check_resource "secret" "team-beta" "splunk-token"
 
 echo ""
 echo "   Secret Contents (team-alpha):"
-if kubectl get secret splunk-config -n team-alpha &> /dev/null; then
-    TOKEN=$(kubectl get secret splunk-config -n team-alpha -o jsonpath='{.data.splunk-token}' | base64 -d)
-    INDEX=$(kubectl get secret splunk-config -n team-alpha -o jsonpath='{.data.splunk-index}' | base64 -d)
+if kubectl get secret splunk-token -n team-alpha &> /dev/null; then
+    TOKEN=$(kubectl get secret splunk-token -n team-alpha -o jsonpath='{.data.splunk-token}' | base64 -d)
     echo "     Token: $TOKEN"
-    echo "     Index: $INDEX"
+    echo "     Note: Index comes from pod label 'consumer-splunk-index'"
 fi
 
 echo ""
 echo "   Secret Contents (team-beta):"
-if kubectl get secret splunk-config -n team-beta &> /dev/null; then
-    TOKEN=$(kubectl get secret splunk-config -n team-beta -o jsonpath='{.data.splunk-token}' | base64 -d)
-    INDEX=$(kubectl get secret splunk-config -n team-beta -o jsonpath='{.data.splunk-index}' | base64 -d)
+if kubectl get secret splunk-token -n team-beta &> /dev/null; then
+    TOKEN=$(kubectl get secret splunk-token -n team-beta -o jsonpath='{.data.splunk-token}' | base64 -d)
     echo "     Token: $TOKEN"
-    echo "     Index: $INDEX"
+    echo "     Note: Index comes from pod label 'consumer-splunk-index'"
 fi
 
 # 4. Check ConfigMaps
@@ -127,19 +125,29 @@ echo ""
 echo "   Pod Status:"
 kubectl get pods -n team-alpha,team-beta,team-gamma | sed 's/^/     /'
 
-# 7. Check Mock Splunk
+# 7. Check Mock Splunk Servers
 echo ""
-echo "7️⃣  Checking Mock Splunk:"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━"
-check_resource "deployment" "splunk-mock" "mock-splunk"
-check_resource "service" "splunk-mock" "mock-splunk"
+echo "7️⃣  Checking Mock Splunk Servers:"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+check_resource "deployment" "splunk-mock" "mock-splunk-consumer"
+check_resource "service" "splunk-mock" "mock-splunk-consumer"
+check_resource "deployment" "splunk-mock" "mock-splunk-infra"
+check_resource "service" "splunk-mock" "mock-splunk-infra"
 
-SPLUNK_READY=$(kubectl get pods -n splunk-mock -l app=mock-splunk -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+SPLUNK_CONSUMER_READY=$(kubectl get pods -n splunk-mock -l app=mock-splunk-consumer -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+SPLUNK_INFRA_READY=$(kubectl get pods -n splunk-mock -l app=mock-splunk-infra -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
 
-if [ "$SPLUNK_READY" = "True" ]; then
-    echo "  ✅ Mock Splunk is ready"
+if [ "$SPLUNK_CONSUMER_READY" = "True" ]; then
+    echo "  ✅ Mock Splunk Consumer is ready"
 else
-    echo "  ⚠️  Mock Splunk is not ready"
+    echo "  ⚠️  Mock Splunk Consumer is not ready"
+    ((ERRORS++))
+fi
+
+if [ "$SPLUNK_INFRA_READY" = "True" ]; then
+    echo "  ✅ Mock Splunk Infrastructure is ready"
+else
+    echo "  ⚠️  Mock Splunk Infrastructure is not ready"
     ((ERRORS++))
 fi
 
@@ -161,14 +169,22 @@ else
 fi
 
 echo ""
-echo "   Checking if logs are being received by Mock Splunk..."
+echo "   Checking if logs are being received by Mock Splunk servers..."
 sleep 3
-LOG_COUNT=$(kubectl logs -n splunk-mock -l app=mock-splunk --tail=50 2>/dev/null | grep "Received log event" | wc -l || echo "0")
+CONSUMER_LOG_COUNT=$(kubectl logs -n splunk-mock -l app=mock-splunk-consumer --tail=50 2>/dev/null | grep "Received log event" | wc -l || echo "0")
+INFRA_LOG_COUNT=$(kubectl logs -n splunk-mock -l app=mock-splunk-infra --tail=50 2>/dev/null | grep "Received log event" | wc -l || echo "0")
 
-if [ "$LOG_COUNT" -gt 0 ]; then
-    echo "  ✅ Mock Splunk has received $LOG_COUNT log events"
+if [ "$CONSUMER_LOG_COUNT" -gt 0 ]; then
+    echo "  ✅ Mock Splunk Consumer has received $CONSUMER_LOG_COUNT log events"
 else
-    echo "  ⚠️  Mock Splunk has not received any logs yet"
+    echo "  ⚠️  Mock Splunk Consumer has not received any logs yet"
+    echo "     This might be normal if just deployed or no consumer pods are running."
+fi
+
+if [ "$INFRA_LOG_COUNT" -gt 0 ]; then
+    echo "  ✅ Mock Splunk Infrastructure has received $INFRA_LOG_COUNT log events"
+else
+    echo "  ⚠️  Mock Splunk Infrastructure has not received any logs yet"
     echo "     This might be normal if just deployed. Wait a minute and check again."
 fi
 
@@ -184,10 +200,11 @@ if [ $ERRORS -eq 0 ]; then
     echo ""
     echo "💡 Next Steps:"
     echo "   1. Watch logs in real-time: ./scripts/watch-logs.sh"
-    echo "   2. Check Mock Splunk: kubectl logs -f -n splunk-mock -l app=mock-splunk"
-    echo "   3. Verify team-alpha logs appear with ALPHA-TOKEN-12345"
-    echo "   4. Verify team-beta logs appear with BETA-TOKEN-67890"
-    echo "   5. Verify team-gamma logs do NOT appear (namespace not labeled)"
+    echo "   2. Check Mock Splunk Consumer: kubectl logs -f -n splunk-mock -l app=mock-splunk-consumer"
+    echo "   3. Check Mock Splunk Infrastructure: kubectl logs -f -n splunk-mock -l app=mock-splunk-infra"
+    echo "   4. Verify consumer logs (pods with label 'consumer-splunk-index' + container 'app')"
+    echo "      appear in Mock Splunk Consumer"
+    echo "   5. Verify infrastructure logs (all other logs) appear in Mock Splunk Infrastructure"
 else
     echo "❌ Found $ERRORS issues. Please review the output above."
     echo ""

@@ -5,173 +5,47 @@ metadata:
   name: fluent-bit-lua-scripts
   namespace: logging
 data:
-  filter_namespace.lua: |
-    -- Filter logs based on namespace labels
-    -- Only processes logs from namespaces with fluent-bit-enabled=true
-    
-    local namespace_cache = {}
-    local cache_ttl = 300  -- 5 minutes
+  retag_logs.lua: |
+    -- Re-tag logs based on pod label and container name
+    -- If pod has label "consumer-splunk-index" AND container name is "app" → tag as "consumer-logs"
+    -- All other logs → tag as "tdp-infra"
 
-    function execute_command(cmd)
-        local handle = io.popen(cmd)
-        if not handle then
-            return nil
-        end
-        local result = handle:read("*a")
-        handle:close()
-        return result
-    end
+    function retag_by_label_and_container(tag, timestamp, record)
+        local kubernetes = record["kubernetes"]
+        local new_tag = "tdp-infra"  -- Default tag
 
-    function get_namespace_labels(namespace)
-        -- Check cache first
-        local cached = namespace_cache[namespace]
-        if cached and (os.time() - cached.timestamp) < cache_ttl then
-            return cached.labels
-        end
-        
-        -- Read service account token
-        local token_file = io.open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r")
-        if not token_file then
-            return nil
-        end
-        local token = token_file:read("*a")
-        token_file:close()
-        
-        -- Fetch namespace metadata from Kubernetes API
-        local url = string.format("https://kubernetes.default.svc/api/v1/namespaces/%s", namespace)
-        local curl_cmd = string.format(
-            'curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer %s" %s 2>/dev/null',
-            token, url
-        )
-        
-        local response = execute_command(curl_cmd)
-        if not response then
-            return nil
-        end
-        
-        -- Parse labels from JSON response
-        local labels = {}
-        local labels_section = response:match('"labels"%s*:%s*{([^}]+)}')
-        if labels_section then
-            local enabled = labels_section:match('"fluent%-bit%-enabled"%s*:%s*"([^"]+)"')
-            if enabled then
-                labels["fluent-bit-enabled"] = enabled
+        if kubernetes then
+            local labels = kubernetes["labels"]
+            local container_name = kubernetes["container_name"]
+
+            -- Check if pod has the "consumer-splunk-index" label AND container name is "app"
+            if labels and labels["consumer-splunk-index"] and container_name == "app" then
+                -- Extract the index value from the label and add it to the record
+                record["splunk_index"] = labels["consumer-splunk-index"]
+                record["_log_type"] = "consumer"
+                new_tag = "consumer-logs"
+            else
+                -- All other logs are tagged as tdp-infra
+                record["_log_type"] = "infrastructure"
+                new_tag = "tdp-infra"
             end
         end
-        
-        -- Cache the result
-        namespace_cache[namespace] = {
-            labels = labels,
-            timestamp = os.time()
-        }
-        
-        return labels
-    end
 
-    function filter_by_namespace_label(tag, timestamp, record)
-        local kubernetes = record["kubernetes"]
-        
-        if not kubernetes then
-            -- No kubernetes metadata, drop
-            return -1, timestamp, record
-        end
-        
-        local namespace = kubernetes["namespace_name"]
-        if not namespace then
-            -- No namespace info, drop
-            return -1, timestamp, record
-        end
-        
-        -- Check if namespace has the required label
-        local ns_labels = get_namespace_labels(namespace)
-        
-        if not ns_labels or ns_labels["fluent-bit-enabled"] ~= "true" then
-            -- Namespace not labeled for log collection, drop
-            return -1, timestamp, record
-        end
-        
-        -- Keep the record
-        return 1, timestamp, record
-    end
+        -- Store the new tag in the record for reference
+        record["_original_tag"] = tag
+        record["_new_tag"] = new_tag
 
-  filter_container.lua: |
-    -- Filter out system and sidecar containers
-    -- Only keeps application container logs
-    
-    local excluded_containers = {
-        ["coredns"] = true,
-        ["local-path-provisioner"] = true,
-        ["metrics-server"] = true,
-        ["traefik"] = true,
-        ["istio-proxy"] = true,
-        ["istio-init"] = true,
-        ["linkerd-proxy"] = true,
-        ["linkerd-init"] = true,
-        ["kube-proxy"] = true,
-        ["fluent-bit"] = true,
-        ["fluentd"] = true,
-        ["prometheus"] = true,
-        ["grafana"] = true,
-    }
-
-    local excluded_prefixes = {
-        "svclb-",
-        "init-",
-        "setup-",
-    }
-
-    function is_excluded_container(container_name)
-        -- Check exact matches
-        if excluded_containers[container_name] then
-            return true
-        end
-        
-        -- Check prefixes
-        for _, prefix in ipairs(excluded_prefixes) do
-            if container_name:sub(1, #prefix) == prefix then
-                return true
-            end
-        end
-        
-        return false
-    end
-
-    function filter_application_containers(tag, timestamp, record)
-        local kubernetes = record["kubernetes"]
-        
-        if not kubernetes then
-            return -1, timestamp, record
-        end
-        
-        local container_name = kubernetes["container_name"]
-        
-        if not container_name then
-            -- No container name, drop
-            return -1, timestamp, record
-        end
-        
-        -- Check if this is an excluded container
-        if is_excluded_container(container_name) then
-            return -1, timestamp, record
-        end
-        
-        -- Check pod labels for explicit exclusion
-        local labels = kubernetes["labels"]
-        if labels and labels["fluent-bit-exclude"] == "true" then
-            return -1, timestamp, record
-        end
-        
-        -- This is an application container, keep it
+        -- Return code 1 (keep record) - we'll use rewrite_tag filter for actual re-tagging
         return 1, timestamp, record
     end
 
   enrich_splunk.lua: |
-    -- Enrich logs with Splunk configuration from Kubernetes secrets
-    -- Fetches splunk-token and splunk-index from namespace secrets
-    
+    -- Enrich logs with Splunk token from Kubernetes secrets
+    -- Note: splunk-index is already added by retag_logs.lua from pod label
+
     local secret_cache = {}
-    local cache_ttl = 60  -- 1 minute cache
-    local default_secret_name = "splunk-config"
+    local cache_ttl = 1800  -- 30 minute cache
+    local default_secret_name = "splunk-token"
 
     function execute_command(cmd)
         local handle = io.popen(cmd)
@@ -186,12 +60,12 @@ data:
     function get_k8s_secret(namespace, secret_name)
         local cache_key = namespace .. "/" .. secret_name
         local cached = secret_cache[cache_key]
-        
+
         -- Check cache
         if cached and (os.time() - cached.timestamp) < cache_ttl then
             return cached.data
         end
-        
+
         -- Read service account token
         local token_file = io.open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r")
         if not token_file then
@@ -199,83 +73,77 @@ data:
         end
         local token = token_file:read("*a")
         token_file:close()
-        
+
         -- Fetch secret from Kubernetes API
-        local url = string.format("https://kubernetes.default.svc/api/v1/namespaces/%s/secrets/%s", 
+        local url = string.format("https://kubernetes.default.svc/api/v1/namespaces/%s/secrets/%s",
                                  namespace, secret_name)
-        
+
         local curl_cmd = string.format(
             'curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer %s" %s 2>/dev/null',
             token, url
         )
-        
+
         local response = execute_command(curl_cmd)
-        
+
         if not response or response == "" then
             return nil, "Empty response"
         end
-        
-        -- Parse base64-encoded secret data
+
+        -- Parse base64-encoded secret data (only token now)
         local splunk_token_b64 = response:match('"splunk%-token"%s*:%s*"([^"]+)"')
-        local splunk_index_b64 = response:match('"splunk%-index"%s*:%s*"([^"]+)"')
-        
-        if not splunk_token_b64 or not splunk_index_b64 then
-            return nil, "Missing fields in secret"
+
+        if not splunk_token_b64 then
+            return nil, "Missing splunk-token in secret"
         end
-        
-        -- Decode base64 values
+
+        -- Decode base64 value
         local splunk_token = execute_command(string.format('echo "%s" | base64 -d 2>/dev/null', splunk_token_b64))
-        local splunk_index = execute_command(string.format('echo "%s" | base64 -d 2>/dev/null', splunk_index_b64))
-        
-        -- Clean up decoded values
+
+        -- Clean up decoded value
         if splunk_token then
             splunk_token = splunk_token:gsub("\n", ""):gsub("\r", "")
         end
-        if splunk_index then
-            splunk_index = splunk_index:gsub("\n", ""):gsub("\r", "")
+
+        if not splunk_token or splunk_token == "" then
+            return nil, "Failed to decode token"
         end
-        
-        if not splunk_token or not splunk_index or splunk_token == "" or splunk_index == "" then
-            return nil, "Failed to decode"
-        end
-        
+
         local secret_data = {
-            token = splunk_token,
-            index = splunk_index
+            token = splunk_token
         }
-        
+
         -- Cache the result
         secret_cache[cache_key] = {
             data = secret_data,
             timestamp = os.time()
         }
-        
+
         return secret_data
     end
 
     function enrich_with_splunk_config(tag, timestamp, record)
         local kubernetes = record["kubernetes"]
-        
+
         if not kubernetes then
             return -1, timestamp, record
         end
-        
+
         local namespace = kubernetes["namespace_name"]
         local labels = kubernetes["labels"]
-        
+
         if not namespace then
             return -1, timestamp, record
         end
-        
+
         -- Determine secret name (from pod label or use default)
         local secret_name = default_secret_name
         if labels and labels["splunk-config-secret"] then
             secret_name = labels["splunk-config-secret"]
         end
-        
+
         -- Fetch secret from Kubernetes API
         local secret_data, err = get_k8s_secret(namespace, secret_name)
-        
+
         if not secret_data then
             -- Log error in record for debugging
             record["_secret_fetch_error"] = err or "unknown"
@@ -284,11 +152,11 @@ data:
             -- Keep record but mark it for troubleshooting
             return 1, timestamp, record
         end
-        
-        -- Enrich record with Splunk configuration
+
+        -- Enrich record with Splunk token
+        -- Note: splunk_index is already set by retag_logs.lua from pod label
         record["splunk_token"] = secret_data.token
-        record["splunk_index"] = secret_data.index
         record["_enriched"] = "true"
-        
+
         return 1, timestamp, record
     end

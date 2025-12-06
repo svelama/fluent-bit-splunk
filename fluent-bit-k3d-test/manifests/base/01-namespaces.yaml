@@ -15,7 +15,7 @@ metadata:
   labels:
     name: splunk-mock
 ---
-# Team Alpha namespace - WITH label (logs will be collected)
+# Team Alpha namespace - Consumer application
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -23,9 +23,8 @@ metadata:
   labels:
     name: team-alpha
     team: alpha
-    fluent-bit-enabled: "true"  # This enables log collection
 ---
-# Team Beta namespace - WITH label (logs will be collected)
+# Team Beta namespace - Consumer application
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -33,9 +32,8 @@ metadata:
   labels:
     name: team-beta
     team: beta
-    fluent-bit-enabled: "true"  # This enables log collection
 ---
-# Team Gamma namespace - NO label (logs will NOT be collected)
+# Team Gamma namespace - Infrastructure logs
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -43,5 +41,3 @@ metadata:
   labels:
     name: team-gamma
     team: gamma
-    # Note: fluent-bit-enabled label is intentionally missing
-    # This namespace's logs should be filtered out

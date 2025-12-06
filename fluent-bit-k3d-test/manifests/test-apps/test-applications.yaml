@@ -1,6 +1,6 @@
 ---
 # Test application in team-alpha namespace
-# Logs should be collected and sent to Splunk
+# Consumer application - logs will be sent to Mock Splunk Consumer
 apiVersion: v1
 kind: Pod
 metadata:
@@ -10,6 +10,7 @@ metadata:
     app: test-app
     team: alpha
     environment: test
+    consumer-splunk-index: "alpha-consumer-index"  # This routes logs to consumer-logs
 spec:
   containers:
   - name: app
@@ -21,7 +22,7 @@ spec:
       i=0
       while true; do
         i=$((i+1))
-        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-alpha application\",\"counter\":$i,\"team\":\"alpha\"}"
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-alpha consumer application\",\"counter\":$i,\"team\":\"alpha\"}"
         sleep 5
       done
     resources:
@@ -32,7 +33,7 @@ spec:
         memory: 32Mi
 ---
 # Test application in team-beta namespace
-# Logs should be collected and sent to Splunk
+# Consumer application - logs will be sent to Mock Splunk Consumer
 apiVersion: v1
 kind: Pod
 metadata:
@@ -42,6 +43,7 @@ metadata:
     app: test-app
     team: beta
     environment: test
+    consumer-splunk-index: "beta-consumer-index"  # This routes logs to consumer-logs
 spec:
   containers:
   - name: app
@@ -53,7 +55,7 @@ spec:
       i=0
       while true; do
         i=$((i+1))
-        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-beta application\",\"counter\":$i,\"team\":\"beta\"}"
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-beta consumer application\",\"counter\":$i,\"team\":\"beta\"}"
         sleep 5
       done
     resources:
@@ -64,7 +66,7 @@ spec:
         memory: 32Mi
 ---
 # Test application in team-gamma namespace
-# Logs should NOT be collected (namespace not labeled)
+# Infrastructure logs - will be sent to Mock Splunk Infrastructure
 apiVersion: v1
 kind: Pod
 metadata:
@@ -74,6 +76,7 @@ metadata:
     app: test-app
     team: gamma
     environment: test
+    # Note: No consumer-splunk-index label, so logs go to tdp-infra
 spec:
   containers:
   - name: app
@@ -85,7 +88,7 @@ spec:
       i=0
       while true; do
         i=$((i+1))
-        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"WARN\",\"message\":\"Log from team-gamma - SHOULD BE FILTERED OUT\",\"counter\":$i,\"team\":\"gamma\"}"
+        echo "{\"timestamp\":\"$(date -Iseconds)\",\"level\":\"INFO\",\"message\":\"Log from team-gamma infrastructure application\",\"counter\":$i,\"team\":\"gamma\"}"
         sleep 5
       done
     resources:
