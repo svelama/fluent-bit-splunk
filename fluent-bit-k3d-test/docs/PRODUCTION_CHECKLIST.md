@@ -99,33 +99,70 @@ local cache_ttl = 600  -- 10 minutes
 
 ## Namespace Setup
 
-### For Each Application Namespace
+### For Each Consumer Namespace
 
-1. **Label the namespace**:
-   ```bash
-   kubectl label namespace <namespace> fluent-bit-enabled=true
-   ```
+Consumer logs are routed based on **pod labels** and **container names**, not namespace labels.
 
-2. **Create Splunk configuration secret**:
+1. **Create Splunk token secret**:
    ```bash
-   kubectl create secret generic splunk-config \
+   kubectl create secret generic splunk-token \
      --from-literal=splunk-token='<HEC-TOKEN>' \
-     --from-literal=splunk-index='<INDEX-NAME>' \
      --namespace=<namespace>
    ```
 
-3. **Apply RBAC**:
+2. **Apply RBAC** (create Role and RoleBinding):
    ```bash
-   ./scripts/setup-namespace.sh <namespace>
+   kubectl apply -f - <<EOF
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: Role
+   metadata:
+     name: fluent-bit-secret-reader
+     namespace: <namespace>
+   rules:
+   - apiGroups: [""]
+     resources: ["secrets"]
+     resourceNames: ["splunk-token"]
+     verbs: ["get"]
+   ---
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: RoleBinding
+   metadata:
+     name: fluent-bit-secret-reader
+     namespace: <namespace>
+   roleRef:
+     apiGroup: rbac.authorization.k8s.io
+     kind: Role
+     name: fluent-bit-secret-reader
+   subjects:
+   - kind: ServiceAccount
+     name: fluent-bit
+     namespace: logging
+   EOF
+   ```
+
+3. **Label your pods** (in pod manifests):
+   ```yaml
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: my-app
+     namespace: <namespace>
+     labels:
+       consumer-splunk-index: "prod-api-logs"  # Your Splunk index
+   spec:
+     containers:
+     - name: app  # Must be exactly "app"
+       image: myapp:latest
    ```
 
 4. **Document configuration**:
    ```
    Namespace: production-api
    Token: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-   Index: prod-api-logs
+   Index: prod-api-logs (via pod label consumer-splunk-index)
    Retention: 90 days
    Owner: API Team
+   Container Name: app (required for consumer routing)
    ```
 
 ## Deployment Steps
@@ -162,19 +199,20 @@ kubectl logs -n logging -l app=fluent-bit | grep -i error
 
 ### 3. Gradual Production Rollout
 
-**Option A: Namespace by Namespace**
+**Option A: Pod by Pod**
 ```bash
-# Start with one namespace
-kubectl label namespace dev-team-a fluent-bit-enabled=true
+# Start with one pod in a namespace
+# Add label to pod manifest
+kubectl apply -f pod-with-consumer-label.yaml
 
 # Monitor for 24 hours
 # Check log volume, errors, latency
 
-# Add next namespace
-kubectl label namespace dev-team-b fluent-bit-enabled=true
+# Roll out to more pods
+kubectl apply -f deployment-with-consumer-labels.yaml
 ```
 
-**Option B: Node by Node** (if using node labels)
+**Option B: Node by Node** (DaemonSet rollout)
 ```yaml
 spec:
   template:
@@ -239,14 +277,15 @@ Set up alerts for:
 
 ### 3. Verification Checklist
 
-- [ ] All expected namespaces are sending logs
+- [ ] All expected consumer pods are sending logs (check pod labels)
 - [ ] No errors in Fluent Bit logs
-- [ ] Logs appearing in correct Splunk indexes
+- [ ] Consumer logs appearing in correct Splunk indexes
+- [ ] Infrastructure logs routing correctly
 - [ ] Log latency is acceptable (< 30 seconds)
 - [ ] Resource usage is within limits
 - [ ] No RBAC permission errors
-- [ ] Secret access is working for all namespaces
-- [ ] Filtered namespaces are properly excluded
+- [ ] Secret access is working for all consumer namespaces
+- [ ] Fluent Bit's own logs are excluded (no recursion)
 
 ### 4. Documentation
 
@@ -276,26 +315,21 @@ Document the following:
 
 ## Operational Procedures
 
-### Adding a New Namespace
+### Adding a New Consumer Namespace
 
 ```bash
 #!/bin/bash
-# add-namespace.sh
+# add-consumer-namespace.sh
 
 NAMESPACE=$1
 HEC_TOKEN=$2
-INDEX_NAME=$3
 
-# 1. Label namespace
-kubectl label namespace $NAMESPACE fluent-bit-enabled=true
-
-# 2. Create secret
-kubectl create secret generic splunk-config \
+# 1. Create secret
+kubectl create secret generic splunk-token \
   --from-literal=splunk-token="$HEC_TOKEN" \
-  --from-literal=splunk-index="$INDEX_NAME" \
   --namespace=$NAMESPACE
 
-# 3. Setup RBAC
+# 2. Setup RBAC
 kubectl apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -305,7 +339,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  resourceNames: ["splunk-config"]
+  resourceNames: ["splunk-token"]
   verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -323,7 +357,17 @@ subjects:
   namespace: logging
 EOF
 
-echo "✅ Namespace $NAMESPACE configured for logging"
+echo "✅ Namespace $NAMESPACE configured with Splunk token"
+echo ""
+echo "📝 Next steps:"
+echo "   1. Add label 'consumer-splunk-index: <your-index>' to your pods"
+echo "   2. Ensure container name is 'app'"
+echo "   3. Example:"
+echo "      labels:"
+echo "        consumer-splunk-index: \"my-index\""
+echo "      spec:"
+echo "        containers:"
+echo "        - name: app"
 ```
 
 ### Rotating Splunk Tokens
@@ -336,23 +380,26 @@ NAMESPACE=$1
 NEW_TOKEN=$2
 
 # Update secret
-kubectl create secret generic splunk-config \
+kubectl create secret generic splunk-token \
   --from-literal=splunk-token="$NEW_TOKEN" \
-  --from-literal=splunk-index="$(kubectl get secret splunk-config -n $NAMESPACE -o jsonpath='{.data.splunk-index}' | base64 -d)" \
   --namespace=$NAMESPACE \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo "✅ Token rotated for namespace $NAMESPACE"
-echo "⏳ New token will be used within 60 seconds (cache TTL)"
+echo "⏳ New token will be used within 30 minutes (cache TTL)"
 ```
 
-### Disabling Logging for a Namespace
+### Disabling Consumer Logging for Pods
+
+Remove the `consumer-splunk-index` label from your pods:
 
 ```bash
-kubectl label namespace <namespace> fluent-bit-enabled-
+# For a deployment
+kubectl patch deployment <deployment-name> -n <namespace> \
+  --type=json -p='[{"op": "remove", "path": "/spec/template/metadata/labels/consumer-splunk-index"}]'
 ```
 
-Logs will stop within 5 minutes (cache TTL).
+Logs will route to infrastructure Splunk instead.
 
 ## Performance Tuning
 
@@ -466,9 +513,9 @@ spec:
 # Backup all manifests
 kubectl get all,secrets,configmaps,roles,rolebindings -n logging -o yaml > fluent-bit-backup.yaml
 
-# Backup namespace configurations
-for ns in $(kubectl get ns -l fluent-bit-enabled=true -o jsonpath='{.items[*].metadata.name}'); do
-  kubectl get secret splunk-config -n $ns -o yaml > backup-$ns-secret.yaml
+# Backup consumer namespace secrets
+for ns in $(kubectl get secrets --all-namespaces -o json | jq -r '.items[] | select(.metadata.name=="splunk-token") | .metadata.namespace'); do
+  kubectl get secret splunk-token -n $ns -o yaml > backup-$ns-secret.yaml
 done
 ```
 

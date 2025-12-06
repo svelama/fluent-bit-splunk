@@ -137,8 +137,8 @@ data:
 
         -- Determine secret name (from pod label or use default)
         local secret_name = default_secret_name
-        if labels and labels["splunk-config-secret"] then
-            secret_name = labels["splunk-config-secret"]
+        if labels and labels["splunk-token-secret"] then
+            secret_name = labels["splunk-token-secret"]
         end
 
         -- Fetch secret from Kubernetes API

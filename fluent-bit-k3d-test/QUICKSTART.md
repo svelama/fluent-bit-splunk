@@ -1,8 +1,12 @@
 # Quick Start Guide
 
+> **Note**: This is a streamlined quick start. For detailed documentation, see:
+> - [README.md](README.md) - Complete overview and architecture
+> - [docs/LOG_PIPELINE_FLOW.md](docs/LOG_PIPELINE_FLOW.md) - Detailed pipeline flow
+
 ## Prerequisites
 
-Before you begin, ensure you have the following installed:
+Ensure you have the following installed:
 
 ```bash
 # Check if tools are installed
@@ -28,16 +32,10 @@ curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 
 ## 5-Minute Setup
 
-### Step 1: Extract the Project
+### Step 1: Create k3d Cluster
 
 ```bash
-tar xzf fluent-bit-k3d-test.tar.gz
 cd fluent-bit-k3d-test
-```
-
-### Step 2: Create k3d Cluster
-
-```bash
 ./scripts/setup-k3d-cluster.sh
 ```
 
@@ -46,172 +44,174 @@ Expected output:
 ✅ k3d cluster created successfully!
 ```
 
-### Step 3: Deploy Everything
+### Step 2: Deploy Everything
 
 ```bash
 ./scripts/complete-deployment.sh
 ```
 
-This will deploy:
-- Namespaces (logging, team-alpha, team-beta, team-gamma, splunk-mock)
-- RBAC configuration
-- Secrets with Splunk configuration
-- Lua filter scripts
-- Fluent Bit DaemonSet
-- Mock Splunk server
-- Test applications
+This will:
+1. Create namespaces (logging, splunk-mock, team-alpha, team-beta, team-gamma)
+2. Deploy mock Splunk servers
+3. Configure RBAC
+4. Create secrets
+5. Deploy Fluent Bit
+6. Deploy test applications
 
-Expected output:
-```
-✅ Deployment Complete!
-```
-
-### Step 4: Validate
+### Step 3: Validate
 
 ```bash
 ./scripts/validate-setup.sh
 ```
 
-This checks:
-- All pods are running
-- RBAC is configured correctly
-- Secrets exist and are readable
-- Logs are flowing to Mock Splunk
+Expected: All checks should pass ✅
 
-### Step 5: Watch Logs
+## Verify Log Flow
+
+### Check Consumer Logs (team-alpha, team-beta)
+
+```bash
+kubectl logs -n splunk-mock -l app=mock-splunk-consumer --tail=50 | grep "Token from body"
+```
+
+Expected output:
+```
+Token from body: ALPHA-TOKEN-12345
+Token from body: BETA-TOKEN-67890
+```
+
+### Check Infrastructure Logs (team-gamma, system pods)
+
+```bash
+kubectl logs -n splunk-mock -l app=mock-splunk-infra --tail=30 | grep "Authorization"
+```
+
+Expected output:
+```
+Authorization: Splunk INFRA-TOKEN-STATIC
+```
+
+## Watch Logs in Real-Time
 
 ```bash
 ./scripts/watch-logs.sh
 ```
 
-This opens multiple log streams (requires tmux for best experience).
+This opens a tmux session with 4 panes:
+- Fluent Bit logs
+- Mock Splunk Consumer
+- Team Alpha app
+- Team Beta app
 
-## What to Expect
+## Understanding the Routing
 
-### Logs Should Appear
+The system routes logs based on **pod labels** and **container names**:
 
-**team-alpha**:
-- Token: `ALPHA-TOKEN-12345`
-- Index: `team-alpha-logs`
-- Logs should appear in Mock Splunk
+### Consumer Logs → mock-splunk-consumer
 
-**team-beta**:
-- Token: `BETA-TOKEN-67890`
-- Index: `team-beta-logs`
-- Logs should appear in Mock Splunk
+**Criteria**: Pod has label `consumer-splunk-index` **AND** container name is `app`
 
-### Logs Should NOT Appear
-
-**team-gamma**:
-- Namespace not labeled with `fluent-bit-enabled: true`
-- Logs should be filtered out
-
-## Manual Verification
-
-### Check Fluent Bit is Processing Logs
-
-```bash
-kubectl logs -n logging -l app=fluent-bit --tail=50
+Example:
+```yaml
+metadata:
+  labels:
+    consumer-splunk-index: "alpha-consumer-index"
+spec:
+  containers:
+  - name: app  # Must be exactly "app"
 ```
 
-Look for:
-- Kubernetes metadata enrichment
-- Lua filter execution
-- No errors fetching secrets
+**Logs from**: team-alpha, team-beta (both have the label + container)
 
-### Check Mock Splunk Received Logs
+### Infrastructure Logs → mock-splunk-infra
 
-```bash
-kubectl logs -n splunk-mock -l app=mock-splunk --tail=50
+**Criteria**: Everything else (no label OR container name != "app")
+
+**Logs from**: team-gamma, system pods, Fluent Bit itself (excluded)
+
+## What's Deployed
+
+| Namespace | Pods | Purpose |
+|-----------|------|---------|
+| `logging` | fluent-bit (DaemonSet) | Log collection and routing |
+| `splunk-mock` | mock-splunk-consumer, mock-splunk-infra | Mock Splunk HEC endpoints |
+| `team-alpha` | test-app-alpha | Consumer app (routes to consumer Splunk) |
+| `team-beta` | test-app-beta | Consumer app (routes to consumer Splunk) |
+| `team-gamma` | test-app-gamma | Infrastructure app (routes to infra Splunk) |
+
+## Adding Your Own Application
+
+### For Consumer Logs
+
+1. **Add label to pod**:
+```yaml
+metadata:
+  labels:
+    consumer-splunk-index: "my-index-name"
 ```
 
-Look for:
-- "Received log event" messages
-- Authorization headers with correct tokens
-- Log content from test applications
-
-### Check Test Applications
-
-```bash
-# team-alpha
-kubectl logs test-app-alpha -n team-alpha --tail=10
-
-# team-beta
-kubectl logs test-app-beta -n team-beta --tail=10
-
-# team-gamma (these should NOT reach Splunk)
-kubectl logs test-app-gamma -n team-gamma --tail=10
+2. **Name container `app`**:
+```yaml
+spec:
+  containers:
+  - name: app
+    image: myapp:latest
 ```
 
-## Common Commands
-
+3. **Create secret** in your namespace:
 ```bash
-# Get all pods
-kubectl get pods -A
-
-# Check Fluent Bit DaemonSet
-kubectl get daemonset -n logging
-
-# Check secrets
-kubectl get secrets -n team-alpha
-kubectl get secrets -n team-beta
-
-# Describe a pod
-kubectl describe pod test-app-alpha -n team-alpha
-
-# Delete and recreate a pod
-kubectl delete pod test-app-alpha -n team-alpha
-kubectl apply -f manifests/test-apps/test-applications.yaml
+kubectl create secret generic splunk-token \
+  --from-literal=splunk-token="YOUR-SPLUNK-TOKEN" \
+  -n your-namespace
 ```
+
+4. **Add RBAC** (see [README.md](README.md) for RBAC configuration)
+
+### For Infrastructure Logs
+
+No special configuration needed! Logs automatically route to infrastructure Splunk if:
+- Pod doesn't have `consumer-splunk-index` label, OR
+- Container name is not `app`
 
 ## Troubleshooting
 
-### Fluent Bit Pod Not Starting
+### No Logs Appearing
 
 ```bash
-# Check pod status
+# Check Fluent Bit is running
 kubectl get pods -n logging
 
-# Check events
-kubectl describe daemonset fluent-bit -n logging
-
-# Check logs
-kubectl logs -n logging -l app=fluent-bit
-```
-
-### No Logs Reaching Mock Splunk
-
-```bash
-# Check if Mock Splunk is running
-kubectl get pods -n splunk-mock
-
-# Check Fluent Bit logs for errors
+# Check for errors
 kubectl logs -n logging -l app=fluent-bit | grep -i error
-
-# Check if secrets are readable
-kubectl get secret splunk-config -n team-alpha -o yaml
 ```
 
-### Namespace Filter Not Working
+### Only Alpha Logs, No Beta
 
 ```bash
-# Check namespace labels
-kubectl get ns team-alpha,team-beta,team-gamma --show-labels
+# Verify beta pod labels
+kubectl get pod test-app-beta -n team-beta -o jsonpath='{.metadata.labels}'
 
-# Check Fluent Bit logs for filter execution
-kubectl logs -n logging -l app=fluent-bit | grep namespace
+# Should include: "consumer-splunk-index":"beta-consumer-index"
+
+# Verify container name
+kubectl get pod test-app-beta -n team-beta -o jsonpath='{.spec.containers[*].name}'
+
+# Should be: app
 ```
 
-## Next Steps
+### Secret Fetch Errors
 
-1. **Review the Architecture**: See `docs/ARCHITECTURE.md`
-2. **Add Your Own Namespace**: Use `./scripts/setup-namespace.sh my-namespace`
-3. **Configure Real Splunk**: Edit `manifests/base/05-fluent-bit-config.yaml`
-4. **Customize Filters**: Edit Lua scripts in `manifests/base/04-lua-scripts.yaml`
+```bash
+# Check RBAC
+kubectl auth can-i get secret/splunk-token -n team-alpha \
+  --as=system:serviceaccount:logging:fluent-bit
+
+# Should return: yes
+```
+
+For more troubleshooting, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Cleanup
-
-When you're done testing:
 
 ```bash
 ./scripts/cleanup.sh
@@ -219,16 +219,62 @@ When you're done testing:
 
 This deletes the entire k3d cluster.
 
-## Production Deployment
+## Next Steps
 
-Before deploying to production:
+- **Read the architecture**: [README.md](README.md)
+- **Understand the pipeline**: [docs/LOG_PIPELINE_FLOW.md](docs/LOG_PIPELINE_FLOW.md)
+- **Learn about Lua scripts**: [docs/LUA_SCRIPTS.md](docs/LUA_SCRIPTS.md)
+- **Production deployment**: [docs/PRODUCTION_CHECKLIST.md](docs/PRODUCTION_CHECKLIST.md)
 
-1. Replace Mock Splunk with real Splunk HEC endpoint
-2. Use real Splunk tokens in secrets
-3. Adjust resource limits based on log volume
-4. Configure TLS certificate verification
-5. Set up monitoring and alerting
-6. Review security and RBAC policies
-7. Test secret rotation procedures
+## Key Concepts
 
-See `docs/PRODUCTION_CHECKLIST.md` for detailed guidance.
+### Dual Routing
+
+Logs are routed to one of two destinations:
+
+1. **Consumer Splunk**: Application logs from labeled pods
+   - Dynamic tokens (from secrets)
+   - Dynamic indexes (from labels)
+   - Per-namespace configuration
+
+2. **Infrastructure Splunk**: System logs and unlabeled pods
+   - Static token
+   - Static index
+   - Centralized configuration
+
+### Secret Management
+
+Each consumer namespace manages its own Splunk token:
+
+```bash
+# team-alpha has its own token
+kubectl get secret splunk-token -n team-alpha
+
+# team-beta has its own token
+kubectl get secret splunk-token -n team-beta
+```
+
+### No Recursive Processing
+
+Fluent Bit automatically excludes its own logs to prevent infinite loops:
+
+```ini
+[FILTER]
+    Name    grep
+    Match   kube.*
+    Exclude kubernetes.namespace_name logging
+```
+
+## Architecture Summary
+
+```
+Application Pods
+     ↓
+Container Logs → Fluent Bit DaemonSet
+     ↓
+Classification (pod label + container name)
+     ├──→ Consumer → Fetch Secret → Consumer Splunk
+     └──→ Infrastructure → Static Config → Infrastructure Splunk
+```
+
+For the complete pipeline flow with detailed stages, see [docs/LOG_PIPELINE_FLOW.md](docs/LOG_PIPELINE_FLOW.md).

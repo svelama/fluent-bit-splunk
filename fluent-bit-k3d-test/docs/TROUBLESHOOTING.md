@@ -64,22 +64,28 @@ kubectl logs test-app-alpha -n team-alpha
 
 #### Common Causes
 
-1. **Namespace filtering**
-   - Namespace missing `fluent-bit-enabled: true` label
+1. **Pod missing consumer label or wrong container name**
+   - Pod must have `consumer-splunk-index` label AND container name `app`
    ```bash
-   kubectl get ns team-alpha --show-labels
-   kubectl label namespace team-alpha fluent-bit-enabled=true
+   # Check pod labels
+   kubectl get pod test-app-alpha -n team-alpha -o jsonpath='{.metadata.labels}'
+
+   # Check container name
+   kubectl get pod test-app-alpha -n team-alpha -o jsonpath='{.spec.containers[*].name}'
    ```
 
-2. **Container filtering**
-   - Container name in exclusion list
-   - Check `filter_container.lua` script
+2. **Fluent Bit logs being processed recursively**
+   - Check if grep filter is excluding Fluent Bit namespace
+   ```bash
+   kubectl get configmap fluent-bit-config -n logging -o yaml | grep -A 3 "Exclude"
+   # Should see: Exclude kubernetes.namespace_name logging
+   ```
 
 3. **Secret fetch failure**
    ```bash
    # Check if secrets exist
-   kubectl get secret splunk-config -n team-alpha
-   
+   kubectl get secret splunk-token -n team-alpha
+
    # Check Fluent Bit logs for secret errors
    kubectl logs -n logging -l app=fluent-bit | grep secret_fetch_error
    ```
@@ -105,68 +111,82 @@ kubectl logs -n logging -l app=fluent-bit | grep "_secret_fetch_error"
 
 1. **Check secret exists**
    ```bash
-   kubectl get secret splunk-config -n team-alpha
+   kubectl get secret splunk-token -n team-alpha
    ```
 
 2. **Check RBAC permissions**
    ```bash
    # Verify Role exists
    kubectl get role fluent-bit-secret-reader -n team-alpha
-   
+
    # Verify RoleBinding exists
    kubectl get rolebinding fluent-bit-secret-reader -n team-alpha
+
+   # Test if Fluent Bit can access the secret
+   kubectl auth can-i get secret/splunk-token -n team-alpha \
+     --as=system:serviceaccount:logging:fluent-bit
+   # Should return: yes
    ```
 
 3. **Check secret format**
    ```bash
-   kubectl get secret splunk-config -n team-alpha -o yaml
+   kubectl get secret splunk-token -n team-alpha -o yaml
    ```
-   
-   Ensure it has both keys:
+
+   Ensure it has the key:
    - `splunk-token`
-   - `splunk-index`
+
+   Note: The `splunk_index` comes from the pod label `consumer-splunk-index`, not the secret
 
 4. **Test secret access manually**
    ```bash
    # Get a shell in Fluent Bit pod
    kubectl exec -n logging -it $(kubectl get pod -n logging -l app=fluent-bit -o jsonpath='{.items[0].metadata.name}') -- sh
-   
+
    # Try to fetch the secret
    TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
    curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
      -H "Authorization: Bearer $TOKEN" \
-     https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-config
+     https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-token
    ```
 
 ---
 
-### 4. Logs from team-gamma Appearing (Should Be Filtered)
+### 4. Consumer Logs Routed to Infrastructure (or vice versa)
 
 #### Symptoms
-Logs from team-gamma appear in Mock Splunk, but they shouldn't
+Logs appear in the wrong Splunk endpoint (consumer logs in infrastructure, or infrastructure logs in consumer)
 
 #### Solutions
 
-1. **Check namespace label**
+1. **Check pod label and container name for consumer logs**
    ```bash
-   kubectl get ns team-gamma --show-labels
-   ```
-   
-   Should NOT have `fluent-bit-enabled: true`
-   
-   If it does:
-   ```bash
-   kubectl label namespace team-gamma fluent-bit-enabled-
+   # For consumer routing, BOTH must be true:
+   # 1. Pod has label: consumer-splunk-index
+   # 2. Container name is: app
+
+   # Check pod labels
+   kubectl get pod test-app-alpha -n team-alpha -o jsonpath='{.metadata.labels}'
+
+   # Check container name
+   kubectl get pod test-app-alpha -n team-alpha -o jsonpath='{.spec.containers[*].name}'
    ```
 
-2. **Check Lua filter execution**
+2. **Check Lua classification script**
    ```bash
-   kubectl logs -n logging -l app=fluent-bit | grep "filter_namespace"
+   kubectl get configmap fluent-bit-lua-scripts -n logging -o yaml | grep -A 20 "retag_by_label_and_container"
    ```
 
-3. **Verify filter is configured**
+3. **Verify rewrite tag filter**
    ```bash
-   kubectl get configmap fluent-bit-config -n logging -o yaml | grep filter_namespace
+   kubectl get configmap fluent-bit-config -n logging -o yaml | grep -A 5 "Rewrite_Tag"
+   ```
+
+4. **Check log classification fields**
+   ```bash
+   # Look for _log_type field in Fluent Bit logs
+   kubectl logs -n logging -l app=fluent-bit --tail=100 | grep "_log_type"
+   # Should see: "consumer" or "infrastructure"
    ```
 
 ---
@@ -239,7 +259,7 @@ kubectl logs -n logging -l app=fluent-bit | grep "429\|rate limit"
 ### 7. Logs Missing Required Fields
 
 #### Symptoms
-Logs in Splunk missing `splunk_token` or `splunk_index` fields
+Consumer logs in Splunk missing `splunk_token` or `splunk_index` fields
 
 #### Solutions
 
@@ -249,15 +269,25 @@ Logs in Splunk missing `splunk_token` or `splunk_index` fields
    ```
 
 2. **Verify filter order**
-   Ensure filters are in correct order in `fluent-bit.conf`:
-   1. kubernetes filter
-   2. filter_namespace
-   3. filter_container
-   4. enrich_splunk_config
+   Ensure filters are in correct order in Fluent Bit config:
+   1. Tail input (reads container logs)
+   2. Kubernetes filter (adds pod metadata)
+   3. Grep filter (excludes Fluent Bit logs)
+   4. Lua classification (retag_logs.lua)
+   5. Rewrite tag (splits stream)
+   6. Lua enrichment (enrich_splunk.lua for consumer logs)
+   7. Modify filter (static fields for infrastructure logs)
 
 3. **Check for errors in Lua scripts**
    ```bash
    kubectl logs -n logging -l app=fluent-bit | grep -i "lua\|script"
+   ```
+
+4. **Verify pod has required label**
+   ```bash
+   # splunk_index comes from pod label
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.metadata.labels.consumer-splunk-index}'
+   # Should return the index name
    ```
 
 ---
@@ -350,7 +380,7 @@ curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
 # Test secret access
 curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
   -H "Authorization: Bearer $TOKEN" \
-  https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-config
+  https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-token
 ```
 
 ### Enable Debug Logging

@@ -2,34 +2,236 @@
 
 ## Overview
 
-This document explains the Lua scripts used by Fluent Bit to filter and enrich log records.
+This document explains the Lua scripts used by Fluent Bit to classify and enrich log records based on pod labels and container names.
+
+## Current Architecture
+
+The system uses **two Lua scripts** for intelligent log routing:
+
+1. **retag_logs.lua** - Classifies logs based on pod labels + container name
+2. **enrich_splunk.lua** - Enriches consumer logs with Splunk tokens from secrets
 
 ## Script Execution Order
 
-1. **filter_namespace.lua** - Filters logs by namespace label
-2. **filter_container.lua** - Filters out system containers
-3. **enrich_splunk.lua** - Enriches logs with Splunk configuration
+```
+Container Logs
+     ↓
+Tail Input → Kubernetes Filter (adds metadata)
+     ↓
+Exclude Fluent Bit Logs (grep filter)
+     ↓
+[1] retag_logs.lua (classification)
+     ↓
+Rewrite Tag Filter (splits stream)
+     ↓
+     ├──→ consumer-logs → [2] enrich_splunk.lua (fetch secrets)
+     │                          ↓
+     │                    Consumer Splunk Output
+     │
+     └──→ tdp-infra → Modify Filter (static values)
+                          ↓
+                    Infrastructure Splunk Output
+```
 
-## filter_namespace.lua
+---
+
+## 1. retag_logs.lua
 
 ### Purpose
-Filters logs based on namespace labels. Only processes logs from namespaces with `fluent-bit-enabled: true`.
+
+Classifies logs into two categories based on pod metadata:
+- **Consumer logs**: Pods with label `consumer-splunk-index` AND container name `app`
+- **Infrastructure logs**: Everything else
+
+### Location
+
+`manifests/base/04-lua-scripts.yaml` → `retag_logs.lua`
 
 ### Flow Diagram
+
 ```
-Record arrives → Extract namespace → Fetch namespace labels (cached)
-                                              ↓
-                           Has label fluent-bit-enabled=true?
-                                    ↓            ↓
-                                   YES          NO
-                                    ↓            ↓
-                               Keep record   Drop record
+Record arrives
+     ↓
+Extract kubernetes metadata
+     ↓
+Check: labels["consumer-splunk-index"] exists?
+     ↓              ↓
+    YES            NO
+     ↓              ↓
+Check: container_name == "app"?    Set _log_type = "infrastructure"
+     ↓              ↓               Set _new_tag = "tdp-infra"
+    YES            NO
+     ↓              ↓
+Set _log_type = "consumer"
+Set splunk_index from label value
+Set _new_tag = "consumer-logs"
+```
+
+### Key Functions
+
+#### `retag_by_label_and_container(tag, timestamp, record)`
+
+Main classification function called by Fluent Bit.
+
+**Parameters:**
+- `tag` (string): Original log tag (e.g., `kube.var.log.containers...`)
+- `timestamp` (number): Log timestamp
+- `record` (table): Log record with Kubernetes metadata
+
+**Returns:**
+- `1` (always keeps record)
+- Modified `record` with classification fields
+
+**Logic:**
+
+```lua
+function retag_by_label_and_container(tag, timestamp, record)
+    local kubernetes = record["kubernetes"]
+    local new_tag = "tdp-infra"  -- Default to infrastructure
+
+    if kubernetes then
+        local labels = kubernetes["labels"]
+        local container_name = kubernetes["container_name"]
+
+        -- Check for consumer criteria
+        if labels and labels["consumer-splunk-index"] and container_name == "app" then
+            -- Consumer log
+            record["splunk_index"] = labels["consumer-splunk-index"]
+            record["_log_type"] = "consumer"
+            new_tag = "consumer-logs"
+        else
+            -- Infrastructure log
+            record["_log_type"] = "infrastructure"
+            new_tag = "tdp-infra"
+        end
+    end
+
+    record["_original_tag"] = tag
+    record["_new_tag"] = new_tag
+
+    return 1, timestamp, record
+end
+```
+
+### Fields Added to Record
+
+| Field | Type | Description | Example |
+|-------|------|-------------|---------|
+| `_log_type` | string | Classification type | `"consumer"` or `"infrastructure"` |
+| `_new_tag` | string | Target tag for re-tagging | `"consumer-logs"` or `"tdp-infra"` |
+| `_original_tag` | string | Original Fluent Bit tag | `kube.var.log.containers...` |
+| `splunk_index` | string | Splunk index (consumer only) | `"alpha-consumer-index"` |
+
+### Example Input/Output
+
+**Input Record** (team-alpha pod):
+```json
+{
+  "log": "Application log message",
+  "kubernetes": {
+    "pod_name": "test-app-alpha",
+    "namespace_name": "team-alpha",
+    "container_name": "app",
+    "labels": {
+      "consumer-splunk-index": "alpha-consumer-index",
+      "team": "alpha"
+    }
+  }
+}
+```
+
+**Output Record**:
+```json
+{
+  "log": "Application log message",
+  "_log_type": "consumer",
+  "_new_tag": "consumer-logs",
+  "_original_tag": "kube.var.log.containers.test-app-alpha_team-alpha_app-abc123.log",
+  "splunk_index": "alpha-consumer-index",
+  "kubernetes": { ... }
+}
+```
+
+**Input Record** (infrastructure pod):
+```json
+{
+  "log": "System log message",
+  "kubernetes": {
+    "pod_name": "test-app-gamma",
+    "namespace_name": "team-gamma",
+    "container_name": "app",
+    "labels": {
+      "team": "gamma"
+      // No consumer-splunk-index label
+    }
+  }
+}
+```
+
+**Output Record**:
+```json
+{
+  "log": "System log message",
+  "_log_type": "infrastructure",
+  "_new_tag": "tdp-infra",
+  "_original_tag": "kube.var.log.containers.test-app-gamma_team-gamma_app-xyz789.log",
+  "kubernetes": { ... }
+}
+```
+
+### Configuration
+
+```yaml
+[FILTER]
+    Name    lua
+    Match   kube.*
+    script  /fluent-bit/scripts/retag_logs.lua
+    call    retag_by_label_and_container
+```
+
+---
+
+## 2. enrich_splunk.lua
+
+### Purpose
+
+Enriches consumer logs with Splunk HEC tokens fetched from Kubernetes secrets in the pod's namespace.
+
+### Location
+
+`manifests/base/04-lua-scripts.yaml` → `enrich_splunk.lua`
+
+### Flow Diagram
+
+```
+Consumer log arrives (tag: consumer-logs)
+     ↓
+Extract namespace from kubernetes.namespace_name
+     ↓
+Check cache for secret (namespace key)
+     ↓              ↓
+  CACHED      NOT CACHED
+     ↓              ↓
+Return cached   Fetch from K8s API
+token              ↓
+                Parse JSON response
+                   ↓
+                Decode base64 token
+                   ↓
+                Cache result (30 min TTL)
+     ↓              ↓
+     └──────┬───────┘
+            ↓
+Add splunk_token to record
+            ↓
+Return enriched record
 ```
 
 ### Key Functions
 
 #### `execute_command(cmd)`
-Executes shell commands and returns output.
+
+Executes shell commands (curl, base64) and returns output.
 
 ```lua
 function execute_command(cmd)
@@ -43,502 +245,387 @@ function execute_command(cmd)
 end
 ```
 
-#### `get_namespace_labels(namespace)`
-Fetches namespace labels from Kubernetes API with caching.
+**Note**: Requires Fluent Bit debug image (`fluent/fluent-bit:2.2-debug`) which includes curl and base64 binaries.
+
+#### `get_k8s_secret(namespace, secret_name)`
+
+Fetches and decodes a Kubernetes secret using the Kubernetes API.
 
 **Parameters:**
-- `namespace` (string): Namespace name
+- `namespace` (string): Namespace containing the secret
+- `secret_name` (string): Name of the secret (default: `"splunk-token"`)
 
 **Returns:**
-- Table of labels or nil
+- `secret_data` (table): `{ token = "ALPHA-TOKEN-12345" }`
+- `error_message` (string): Error if fetch failed
 
 **Caching:**
-- TTL: 300 seconds (5 minutes)
-- Key: namespace name
-- Rationale: Namespace labels rarely change
+- TTL: 1800 seconds (30 minutes)
+- Key: `namespace:secret_name`
+- Rationale: Reduces API calls, secrets change infrequently
 
-**Example:**
-```lua
-local labels = get_namespace_labels("team-alpha")
--- Returns: { ["fluent-bit-enabled"] = "true" }
+**API Call:**
+```bash
+curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-token
 ```
 
-#### `filter_by_namespace_label(tag, timestamp, record)`
-Main filter function called by Fluent Bit.
+**Response Example:**
+```json
+{
+  "data": {
+    "splunk-token": "QUxQSEEtVE9LRU4tMTIzNDU="  // base64 encoded
+  }
+}
+```
+
+**Decoding:**
+```bash
+echo "QUxQSEEtVE9LRU4tMTIzNDU=" | base64 -d
+# Output: ALPHA-TOKEN-12345
+```
+
+#### `enrich_with_splunk_config(tag, timestamp, record)`
+
+Main enrichment function called by Fluent Bit.
 
 **Parameters:**
-- `tag` (string): Log tag
+- `tag` (string): Log tag (should be `consumer-logs`)
 - `timestamp` (number): Log timestamp
 - `record` (table): Log record with Kubernetes metadata
 
 **Returns:**
-- `-1` to drop the record
-- `1` to keep the record
+- `1` (always keeps record)
+- Modified `record` with `splunk_token` field
 
 **Logic:**
-```lua
-if no kubernetes metadata → DROP
-if no namespace name → DROP
-if namespace not labeled with fluent-bit-enabled=true → DROP
-else → KEEP
-```
 
-### API Call Example
-
-```bash
-curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-  -H "Authorization: Bearer $TOKEN" \
-  https://kubernetes.default.svc/api/v1/namespaces/team-alpha
-```
-
-Response:
-```json
-{
-  "metadata": {
-    "name": "team-alpha",
-    "labels": {
-      "fluent-bit-enabled": "true",
-      "team": "alpha"
-    }
-  }
-}
-```
-
-### Customization
-
-To require additional labels:
-
-```lua
-function filter_by_namespace_label(tag, timestamp, record)
-    -- ... existing code ...
-    
-    -- Check for additional label
-    if not ns_labels["environment"] or ns_labels["environment"] ~= "production" then
-        return -1, timestamp, record
-    end
-    
-    return 1, timestamp, record
-end
-```
-
----
-
-## filter_container.lua
-
-### Purpose
-Filters out system and sidecar containers, keeping only application container logs.
-
-### Exclusion Lists
-
-#### Exact Match Exclusions
-```lua
-local excluded_containers = {
-    ["coredns"] = true,
-    ["local-path-provisioner"] = true,
-    ["metrics-server"] = true,
-    ["traefik"] = true,
-    ["istio-proxy"] = true,
-    ["istio-init"] = true,
-    ["linkerd-proxy"] = true,
-    ["linkerd-init"] = true,
-    -- Add more as needed
-}
-```
-
-#### Prefix Exclusions
-```lua
-local excluded_prefixes = {
-    "svclb-",      -- k3s service load balancer
-    "init-",       -- Init containers
-    "setup-",      -- Setup containers
-}
-```
-
-### Key Functions
-
-#### `is_excluded_container(container_name)`
-Checks if a container should be excluded.
-
-**Parameters:**
-- `container_name` (string): Name of the container
-
-**Returns:**
-- `true` if container should be excluded
-- `false` if container should be kept
-
-**Logic:**
-```lua
-if container_name in excluded_containers → true
-if container_name starts with excluded_prefix → true
-else → false
-```
-
-#### `filter_application_containers(tag, timestamp, record)`
-Main filter function.
-
-**Returns:**
-- `-1` to drop the record
-- `1` to keep the record
-
-**Logic:**
-```lua
-if no kubernetes metadata → DROP
-if no container name → DROP
-if container in exclusion list → DROP
-if pod has label fluent-bit-exclude=true → DROP
-else → KEEP
-```
-
-### Customization
-
-#### Add Your Sidecar
-```lua
-local excluded_containers = {
-    -- ... existing ...
-    ["your-sidecar-name"] = true,
-    ["monitoring-agent"] = true,
-}
-```
-
-#### Add Label-based Inclusion
-```lua
-function filter_application_containers(tag, timestamp, record)
-    -- ... existing checks ...
-    
-    -- Only include containers with specific label
-    local labels = kubernetes["labels"]
-    if not labels or labels["log-collection"] ~= "enabled" then
-        return -1, timestamp, record
-    end
-    
-    return 1, timestamp, record
-end
-```
-
----
-
-## enrich_splunk.lua
-
-### Purpose
-Enriches log records with Splunk configuration (HEC token and index) fetched from Kubernetes secrets.
-
-### Flow Diagram
-```
-Record arrives → Extract namespace → Determine secret name
-                                              ↓
-                           Fetch secret from K8s API (cached)
-                                              ↓
-                                    Decode base64 values
-                                              ↓
-                           Enrich record with token and index
-```
-
-### Key Functions
-
-#### `get_k8s_secret(namespace, secret_name)`
-Fetches and decodes secret from Kubernetes API.
-
-**Parameters:**
-- `namespace` (string): Namespace containing the secret
-- `secret_name` (string): Name of the secret
-
-**Returns:**
-- Table: `{ token = "...", index = "..." }`
-- nil, error_message: If fetch fails
-
-**Caching:**
-- TTL: 60 seconds (1 minute)
-- Key: `namespace/secret_name`
-- Rationale: Allows quick secret rotation
-
-**Example:**
-```lua
-local secret, err = get_k8s_secret("team-alpha", "splunk-config")
--- Returns: { token = "ALPHA-TOKEN-12345", index = "team-alpha-logs" }
-```
-
-#### `enrich_with_splunk_config(tag, timestamp, record)`
-Main enrichment function.
-
-**Logic:**
-1. Extract namespace from record
-2. Determine secret name (from pod label or use default)
-3. Fetch secret from Kubernetes API
-4. Decode base64 values
-5. Add `splunk_token` and `splunk_index` to record
-
-**Returns:**
-- `1, timestamp, record` with enriched fields
-- `-1, timestamp, record` if critical error
-
-### API Call Example
-
-```bash
-curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-  -H "Authorization: Bearer $TOKEN" \
-  https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-config
-```
-
-Response:
-```json
-{
-  "data": {
-    "splunk-token": "QUxQSEEtVE9LRU4tMTIzNDU=",
-    "splunk-index": "dGVhbS1hbHBoYS1sb2dz"
-  }
-}
-```
-
-Decoded:
-```
-splunk-token: ALPHA-TOKEN-12345
-splunk-index: team-alpha-logs
-```
-
-### Secret Format
-
-Required keys in the secret:
-- `splunk-token`: Splunk HEC token
-- `splunk-index`: Splunk index name
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: splunk-config
-  namespace: team-alpha
-type: Opaque
-stringData:
-  splunk-token: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  splunk-index: "team-alpha-logs"
-```
-
-### Error Handling
-
-If secret fetch fails:
-- Record is kept (not dropped)
-- Error fields added:
-  - `_secret_fetch_error`: Error message
-  - `_secret_name`: Secret name that was attempted
-  - `_namespace`: Namespace
-
-This allows debugging without losing logs.
-
-### Customization
-
-#### Use Different Secret Name per Pod
 ```lua
 function enrich_with_splunk_config(tag, timestamp, record)
-    -- ... existing code ...
-    
-    local secret_name = default_secret_name
-    
-    -- Check pod annotation
-    local annotations = kubernetes["annotations"]
-    if annotations and annotations["splunk-secret"] then
-        secret_name = annotations["splunk-secret"]
+    local namespace = record["kubernetes"]["namespace_name"]
+    local secret_name = "splunk-token"
+
+    -- Fetch secret (cached)
+    local secret_data, err = get_k8s_secret(namespace, secret_name)
+
+    if not secret_data then
+        -- Log error but keep record
+        record["_secret_fetch_error"] = err or "unknown"
+        record["_secret_name"] = secret_name
+        record["_namespace"] = namespace
+        return 1, timestamp, record
     end
-    
-    -- ... rest of code ...
+
+    -- Add token to record
+    record["splunk_token"] = secret_data.token
+    record["_enriched"] = "true"
+
+    return 1, timestamp, record
 end
 ```
 
-#### Add Additional Secret Fields
+### Fields Added to Record
+
+| Field | Type | Description | When Added |
+|-------|------|-------------|------------|
+| `splunk_token` | string | Splunk HEC token | Success |
+| `_enriched` | string | Enrichment flag | Success |
+| `_secret_fetch_error` | string | Error message | Failure |
+| `_secret_name` | string | Secret name attempted | Failure |
+| `_namespace` | string | Namespace attempted | Failure |
+
+### Example Input/Output
+
+**Input Record** (from retag_logs.lua):
+```json
+{
+  "log": "Application log",
+  "_log_type": "consumer",
+  "splunk_index": "alpha-consumer-index",
+  "kubernetes": {
+    "namespace_name": "team-alpha",
+    "pod_name": "test-app-alpha"
+  }
+}
+```
+
+**Output Record** (success):
+```json
+{
+  "log": "Application log",
+  "_log_type": "consumer",
+  "splunk_index": "alpha-consumer-index",
+  "splunk_token": "ALPHA-TOKEN-12345",
+  "_enriched": "true",
+  "kubernetes": {
+    "namespace_name": "team-alpha",
+    "pod_name": "test-app-alpha"
+  }
+}
+```
+
+**Output Record** (failure):
+```json
+{
+  "log": "Application log",
+  "_log_type": "consumer",
+  "splunk_index": "alpha-consumer-index",
+  "_secret_fetch_error": "Empty response",
+  "_secret_name": "splunk-token",
+  "_namespace": "team-alpha",
+  "kubernetes": { ... }
+}
+```
+
+### Configuration
+
+```yaml
+[FILTER]
+    Name    lua
+    Match   consumer-logs
+    script  /fluent-bit/scripts/enrich_splunk.lua
+    call    enrich_with_splunk_config
+```
+
+### RBAC Requirements
+
+The Fluent Bit ServiceAccount needs permission to read secrets:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fluent-bit-secret-reader
+  namespace: team-alpha
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["splunk-token"]
+  verbs: ["get"]
+```
+
+---
+
+## Cache Implementation
+
+Both scripts use a simple in-memory cache to reduce API calls.
+
+### Cache Structure
+
 ```lua
--- In get_k8s_secret function, add:
-local splunk_sourcetype_b64 = response:match('"splunk%-sourcetype"%s*:%s*"([^"]+)"')
-if splunk_sourcetype_b64 then
-    local splunk_sourcetype = execute_command(string.format('echo "%s" | base64 -d', splunk_sourcetype_b64))
-    secret_data.sourcetype = splunk_sourcetype:gsub("\n", "")
-end
+local secret_cache = {}
 
--- In enrich_with_splunk_config function:
-record["splunk_sourcetype"] = secret_data.sourcetype
+-- Cache entry structure:
+secret_cache["team-alpha:splunk-token"] = {
+    data = { token = "ALPHA-TOKEN-12345" },
+    timestamp = 1733512345
+}
 ```
+
+### Cache Lookup Logic
+
+```lua
+local cache_key = namespace .. ":" .. secret_name
+local cached = secret_cache[cache_key]
+
+if cached and (os.time() - cached.timestamp) < cache_ttl then
+    -- Cache hit - return cached data
+    return cached.data
+else
+    -- Cache miss or expired - fetch from API
+    -- ...
+end
+```
+
+### Cache Tuning
+
+**Default TTL**: 1800 seconds (30 minutes)
+
+**Increase for production** (less API load):
+```lua
+local cache_ttl = 3600  -- 60 minutes
+```
+
+**Decrease for testing** (faster secret rotation):
+```lua
+local cache_ttl = 60  -- 1 minute
+```
+
+**Cache Invalidation**:
+- Cache is per Fluent Bit pod instance
+- Restarting Fluent Bit clears the cache
+- No manual invalidation mechanism
 
 ---
 
 ## Performance Considerations
 
-### Caching Strategy
+### API Call Frequency
 
-**Namespace Labels:**
-- Cache TTL: 300 seconds
-- Reason: Labels change infrequently
-- Impact: Reduces API calls by ~99%
+**Without caching** (assuming 10 consumer pods, 1 log/sec each):
+- 10 pods × 1 log/sec = 10 API calls/sec
+- = 600 API calls/minute per Fluent Bit pod
 
-**Secrets:**
-- Cache TTL: 60 seconds
-- Reason: Allows faster secret rotation
-- Impact: New secrets effective within 1 minute
+**With 30-minute caching**:
+- Initial: 1 API call per namespace
+- Ongoing: 1 API call per namespace every 30 minutes
+- = ~0.033 API calls/minute per namespace
+
+**Reduction**: 99.99% fewer API calls
 
 ### Memory Usage
 
-Each cached entry stores:
-- Namespace cache: ~100 bytes per namespace
-- Secret cache: ~200 bytes per secret
+**Per cache entry**: ~100 bytes
+- Key: ~30 bytes
+- Token: ~30 bytes
+- Timestamp: 8 bytes
+- Overhead: ~32 bytes
 
-For 100 namespaces:
-- Total cache size: ~30KB
-- Negligible impact on Fluent Bit memory
+**Total cache size** (100 namespaces): ~10 KB
 
-### API Call Rate
+### CPU Usage
 
-Without caching:
-- 1000 logs/sec × 2 API calls = 2000 API calls/sec
-
-With caching:
-- ~20 API calls/sec (cache misses only)
-- 99% reduction in API load
+**Lua execution time**: <1ms per log record
+- Label lookup: O(1) hash table access
+- String operations: Negligible
+- Cache lookup: O(1) hash table access
 
 ---
 
-## Debugging Lua Scripts
+## Debugging
 
-### Enable Debug Output
+### Enable Lua Debug Logging
 
-Add debug prints:
-```lua
-function filter_by_namespace_label(tag, timestamp, record)
-    print("DEBUG: Processing record for namespace: " .. tostring(record["kubernetes"]["namespace_name"]))
-    -- ... rest of function ...
-end
+Edit Fluent Bit configuration:
+```ini
+[SERVICE]
+    Log_Level debug
 ```
 
-View in Fluent Bit logs:
+### Check for Errors
+
+**Secret fetch errors**:
 ```bash
-kubectl logs -n logging -l app=fluent-bit | grep DEBUG
+kubectl logs -n logging -l app=fluent-bit | grep "_secret_fetch_error"
 ```
 
-### Test Script Locally
-
-Create test harness:
-```lua
--- test.lua
-package.path = package.path .. ";/path/to/scripts/?.lua"
-require("filter_namespace")
-
-local test_record = {
-    kubernetes = {
-        namespace_name = "team-alpha",
-        container_name = "app"
-    }
-}
-
-local code, ts, result = filter_by_namespace_label("test", 0, test_record)
-print("Result code:", code)
-print("Record:", require("inspect")(result))
-```
-
-Run:
+**General Lua errors**:
 ```bash
-lua test.lua
+kubectl logs -n logging -l app=fluent-bit | grep -i "lua error"
 ```
 
-### Common Issues
+### Verify Classification
 
-#### 1. API Call Fails
-```lua
--- Check token is readable
-local token_file = io.open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r")
-if not token_file then
-    print("ERROR: Cannot read service account token")
-    return nil
-end
-```
-
-#### 2. Base64 Decode Fails
-```lua
--- Add error handling
-local splunk_token = execute_command(string.format('echo "%s" | base64 -d 2>&1', splunk_token_b64))
-if splunk_token:match("invalid") then
-    print("ERROR: Invalid base64 encoding")
-    return nil, "base64 decode failed"
-end
-```
-
-#### 3. Cache Not Working
-```lua
--- Add cache hit logging
-function get_k8s_secret(namespace, secret_name)
-    local cache_key = namespace .. "/" .. secret_name
-    local cached = secret_cache[cache_key]
-    
-    if cached and (os.time() - cached.timestamp) < cache_ttl then
-        print("DEBUG: Cache hit for " .. cache_key)
-        return cached.data
-    end
-    
-    print("DEBUG: Cache miss for " .. cache_key)
-    -- ... fetch from API ...
-end
-```
-
----
-
-## Best Practices
-
-1. **Always check for nil**
-   ```lua
-   if not record or not record["kubernetes"] then
-       return -1, timestamp, record
-   end
-   ```
-
-2. **Use caching aggressively**
-   - Reduces API load
-   - Improves performance
-   - But balance with freshness requirements
-
-3. **Handle errors gracefully**
-   - Don't drop logs on errors
-   - Add error fields for debugging
-   - Log errors to stdout
-
-4. **Keep functions small**
-   - Easier to test
-   - Easier to debug
-   - Better performance
-
-5. **Document your changes**
-   - Add comments
-   - Update this documentation
-   - Include examples
-
----
-
-## Testing
-
-### Unit Tests
-
-Test individual functions:
+Check Fluent Bit stdout to see classification fields:
 ```bash
-# Test namespace filter
-kubectl exec -n logging -it $(kubectl get pod -n logging -l app=fluent-bit -o jsonpath='{.items[0].metadata.name}') -- sh
+kubectl logs -n logging -l app=fluent-bit --tail=50 | jq ._log_type
+```
+
+Expected output:
+```
+"consumer"
+"consumer"
+"infrastructure"
+"consumer"
+...
+```
+
+### Test Secret Fetching Manually
+
+From inside Fluent Bit pod:
+```bash
+kubectl exec -it -n logging fluent-bit-xxxxx -- sh
+
 # Inside pod:
-lua -e "dofile('/fluent-bit/scripts/filter_namespace.lua'); print(get_namespace_labels('team-alpha'))"
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+curl -s --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  https://kubernetes.default.svc/api/v1/namespaces/team-alpha/secrets/splunk-token \
+  | jq -r '.data."splunk-token"' | base64 -d
+
+# Expected: ALPHA-TOKEN-12345
 ```
 
-### Integration Tests
+---
 
-Test end-to-end:
+## Security Considerations
+
+### Least Privilege
+
+- ServiceAccount only has `get` permission on specific secret names
+- Cannot list all secrets
+- Cannot modify secrets
+- Scoped per namespace via Role (not ClusterRole)
+
+### Secret Exposure
+
+- Tokens are in memory only (cache)
+- Tokens logged to stdout in debug fields (not recommended for production)
+- Consider removing `_enriched` and token fields before final output in production
+
+### Container Requirements
+
+Requires **debug image** for curl and base64:
+```yaml
+image: fluent/fluent-bit:2.2-debug
+```
+
+**Production alternative**: Use official image + install curl/base64 via init container
+
+---
+
+## Common Issues
+
+### Issue: `_secret_fetch_error: "Empty response"`
+
+**Cause**: RBAC permissions not configured
+
+**Fix**:
 ```bash
-# Create test pod
-kubectl run test-pod --image=busybox -n team-alpha -- sh -c "while true; do echo test; sleep 5; done"
+kubectl auth can-i get secret/splunk-token -n team-alpha \
+  --as=system:serviceaccount:logging:fluent-bit
 
-# Check if logs appear in Splunk
-kubectl logs -n splunk-mock -l app=mock-splunk | grep "test-pod"
+# Should return: yes
 ```
 
-### Load Tests
+### Issue: `_secret_fetch_error: "Missing splunk-token in secret"`
 
-Test under high load:
+**Cause**: Secret exists but doesn't have `splunk-token` key
+
+**Fix**: Check secret structure:
 ```bash
-# Create multiple test pods
-for i in {1..10}; do
-  kubectl run test-pod-$i --image=busybox -n team-alpha -- sh -c "while true; do echo test-$i; sleep 1; done"
-done
-
-# Monitor Fluent Bit performance
-kubectl top pods -n logging
+kubectl get secret splunk-token -n team-alpha -o yaml
 ```
+
+Expected:
+```yaml
+data:
+  splunk-token: QUxQSEEtVE9LRU4tMTIzNDU=
+```
+
+### Issue: Logs classified as infrastructure instead of consumer
+
+**Cause**: Pod missing label or wrong container name
+
+**Fix**: Verify pod configuration:
+```bash
+# Check label
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.metadata.labels.consumer-splunk-index}'
+
+# Check container name
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].name}'
+```
+
+Both must be present:
+- Label: `consumer-splunk-index` with a value
+- Container: named exactly `app`
+
+---
+
+## Related Documentation
+
+- [LOG_PIPELINE_FLOW.md](LOG_PIPELINE_FLOW.md) - Complete pipeline walkthrough
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Troubleshooting guide
+- [PRODUCTION_CHECKLIST.md](PRODUCTION_CHECKLIST.md) - Production deployment
