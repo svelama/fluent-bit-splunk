@@ -16,11 +16,34 @@ spec:
         app: fluent-bit
     spec:
       serviceAccountName: fluent-bit
+      initContainers:
+      - name: install-tools
+        image: busybox:1.36
+        command:
+          - sh
+          - -c
+          - |
+            echo "Downloading static curl binary..."
+            wget -O /tools/curl https://github.com/moparisthebest/static-curl/releases/download/v8.1.2/curl-amd64
+            chmod +x /tools/curl
+            echo "Copying base64 binary..."
+            cp /bin/base64 /tools/base64
+            chmod +x /tools/base64
+            echo "Tools installation complete"
+            ls -lh /tools/
+        volumeMounts:
+        - name: tools
+          mountPath: /tools
       containers:
       - name: fluent-bit
-        image: fluent/fluent-bit:2.2-debug
+        image: fluent/fluent-bit:2.2
         imagePullPolicy: IfNotPresent
+        env:
+        - name: PATH
+          value: "/tools:/fluent-bit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
         volumeMounts:
+        - name: tools
+          mountPath: /tools
         - name: varlog
           mountPath: /var/log
         - name: varlibcontainers
@@ -42,6 +65,8 @@ spec:
           protocol: TCP
       terminationGracePeriodSeconds: 10
       volumes:
+      - name: tools
+        emptyDir: {}
       - name: varlog
         hostPath:
           path: /var/log
